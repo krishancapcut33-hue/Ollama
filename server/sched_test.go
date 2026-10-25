@@ -916,6 +916,58 @@ func TestSchedFindRunnerToUnload(t *testing.T) {
 	require.Equal(t, r1, resp)
 }
 
+// TestSchedAnyLoadedRunnerUsingVRAM covers the pre-flight gate for
+// https://github.com/ollama/ollama/issues/19279: a CPU-only model (vramSize 0)
+// must not count as a reason to evict, because evicting it frees no GPU
+// memory.
+func TestSchedAnyLoadedRunnerUsingVRAM(t *testing.T) {
+	ctx, done := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer done()
+	s := InitScheduler(ctx)
+	s.loadedMu.Lock()
+	require.False(t, s.anyLoadedRunnerUsingVRAM())
+	s.loaded["cpu"] = &runnerRef{vramSize: 0, numParallel: 1}
+	require.False(t, s.anyLoadedRunnerUsingVRAM())
+	s.loaded["gpu"] = &runnerRef{vramSize: 1 << 30, numParallel: 1}
+	require.True(t, s.anyLoadedRunnerUsingVRAM())
+	delete(s.loaded, "gpu")
+	require.False(t, s.anyLoadedRunnerUsingVRAM())
+	s.loadedMu.Unlock()
+}
+
+// TestSchedFindRunnerToUnloadForGPUFit covers the GPU-fit victim choice for
+// https://github.com/ollama/ollama/issues/19279: when a GPU placement needs
+// room, an idle CPU-only runner must never be picked ahead of a runner that
+// actually holds VRAM, and no runner at all is picked when none uses VRAM.
+func TestSchedFindRunnerToUnloadForGPUFit(t *testing.T) {
+	ctx, done := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer done()
+	cpuIdle := &runnerRef{refCount: 0, vramSize: 0, sessionDuration: 1, numParallel: 1}
+	gpuBusy := &runnerRef{refCount: 1, vramSize: 1 << 30, sessionDuration: 2, numParallel: 1}
+	gpuIdle := &runnerRef{refCount: 0, vramSize: 2 << 30, sessionDuration: 3, numParallel: 1}
+	s := InitScheduler(ctx)
+	s.waitForRecovery = 10 * time.Millisecond
+	s.loadedMu.Lock()
+	s.loaded["cpu"] = cpuIdle
+	s.loaded["gpu-busy"] = gpuBusy
+	s.loadedMu.Unlock()
+	// The only VRAM holder is busy, but it is still the only useful victim:
+	// evicting the idle CPU-only runner would free no GPU memory.
+	require.Equal(t, gpuBusy, s.findRunnerToUnloadForGPUFit())
+	s.loadedMu.Lock()
+	s.loaded["gpu-idle"] = gpuIdle
+	s.loadedMu.Unlock()
+	require.Equal(t, gpuIdle, s.findRunnerToUnloadForGPUFit())
+	s.loadedMu.Lock()
+	delete(s.loaded, "gpu-busy")
+	delete(s.loaded, "gpu-idle")
+	s.loadedMu.Unlock()
+	require.Nil(t, s.findRunnerToUnloadForGPUFit())
+	// The unfiltered picker is unchanged: it still picks the idle CPU-only
+	// runner, which is correct for runner-count evictions but not for GPU fit.
+	require.Equal(t, cpuIdle, s.findRunnerToUnload())
+}
+
 func TestSchedNeedsReload(t *testing.T) {
 	ctx, done := context.WithTimeout(t.Context(), 100*time.Millisecond)
 	defer done()
