@@ -368,7 +368,17 @@ func (s *Scheduler) processPending(ctx context.Context) {
 						continue
 					}
 
-					runnerToExpire = s.findRunnerToUnload()
+					// This is a GPU-fit eviction (pre-flight prediction or a
+					// post-spawn ErrLoadRequiredFull), not a runner-count
+					// eviction, so prefer a runner that actually holds VRAM:
+					// evicting a CPU-only runner frees no GPU memory.
+					// Fall back to any runner when none uses VRAM, so the
+					// set still drains to the requireFull=false load path
+					// instead of spinning on a nil victim.
+					runnerToExpire = s.findRunnerToUnloadForGPUFit()
+					if runnerToExpire == nil {
+						runnerToExpire = s.findRunnerToUnload()
+					}
 				}
 
 				if runnerToExpire == nil {
@@ -593,7 +603,27 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 				freeMemory, gpuFreeMemory, systemLimited := availableMemoryForPlacement(systemInfo, loadGpus, launchOpts)
 				// Use 80% of free memory as threshold to leave headroom.
 				if predictedForLoad > freeMemory*80/100 {
-					slog.Info("llama-server model predicted to exceed available memory, evicting",
+					// Evicting a runner that uses no VRAM cannot free GPU
+					// memory, so a prediction miss must not evict a CPU-only
+					// model (e.g. an embedding model with num_gpu 0). Only
+					// trigger the pre-flight eviction when some loaded runner
+					// actually holds VRAM; otherwise fall through and let the
+					// spawn attempt decide, since the prediction may be based
+					// on stale free-memory numbers.
+					// See https://github.com/ollama/ollama/issues/19279
+					if s.anyLoadedRunnerUsingVRAM() {
+						slog.Info("llama-server model predicted to exceed available memory, evicting",
+							"predicted", format.HumanBytes2(predictedForLoad),
+							"predicted_num_ctx", predictedCtx,
+							"num_batch", launchOpts.NumBatch,
+							"available", format.HumanBytes2(freeMemory),
+							"gpu_free", format.HumanBytes2(gpuFreeMemory),
+							"system_free", format.HumanBytes2(systemInfo.FreeMemory),
+							"system_limited", systemLimited)
+						s.loadedMu.Unlock()
+						return true
+					}
+					slog.Info("llama-server model predicted to exceed available memory, but no loaded runner uses VRAM; skipping pre-flight eviction",
 						"predicted", format.HumanBytes2(predictedForLoad),
 						"predicted_num_ctx", predictedCtx,
 						"num_batch", launchOpts.NumBatch,
@@ -601,17 +631,16 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 						"gpu_free", format.HumanBytes2(gpuFreeMemory),
 						"system_free", format.HumanBytes2(systemInfo.FreeMemory),
 						"system_limited", systemLimited)
-					s.loadedMu.Unlock()
-					return true
+				} else {
+					slog.Info("llama-server model fits alongside existing models",
+						"predicted", format.HumanBytes2(predictedForLoad),
+						"predicted_num_ctx", predictedCtx,
+						"num_batch", launchOpts.NumBatch,
+						"available", format.HumanBytes2(freeMemory),
+						"gpu_free", format.HumanBytes2(gpuFreeMemory),
+						"system_free", format.HumanBytes2(systemInfo.FreeMemory),
+						"system_limited", systemLimited)
 				}
-				slog.Info("llama-server model fits alongside existing models",
-					"predicted", format.HumanBytes2(predictedForLoad),
-					"predicted_num_ctx", predictedCtx,
-					"num_batch", launchOpts.NumBatch,
-					"available", format.HumanBytes2(freeMemory),
-					"gpu_free", format.HumanBytes2(gpuFreeMemory),
-					"system_free", format.HumanBytes2(systemInfo.FreeMemory),
-					"system_limited", systemLimited)
 			}
 
 			launchOpts = s.applyLlamaServerMmapDefaults(req, launchOpts, systemInfo, loadGpus, f, numParallel)
@@ -1739,6 +1768,52 @@ func (s *Scheduler) findRunnerToUnload() *runnerRef {
 	}
 	// None appear idle, just wait for the one with the shortest duration
 	slog.Debug("no idle runners, picking the shortest duration", "runner_count", len(runnerList), "runner", runnerList[0])
+	return runnerList[0]
+}
+
+// anyLoadedRunnerUsingVRAM reports whether any currently loaded runner holds
+// GPU memory. The caller must hold s.loadedMu. A runner's vramSize is set once
+// when it is created and never mutated afterwards, so reading it under
+// loadedMu is safe; refMu must not be taken here because the expiration path
+// locks the two mutexes in the opposite order.
+func (s *Scheduler) anyLoadedRunnerUsingVRAM() bool {
+	for _, runner := range s.loaded {
+		if runner.vramSize > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// findRunnerToUnloadForGPUFit is findRunnerToUnload restricted to runners that
+// actually hold GPU memory, with the same idle-first, shortest-duration
+// ordering. It returns nil when no loaded runner uses VRAM, so callers can
+// fall back to findRunnerToUnload instead of evicting a CPU-only runner that
+// would free no GPU memory. See https://github.com/ollama/ollama/issues/19279
+func (s *Scheduler) findRunnerToUnloadForGPUFit() *runnerRef {
+	s.loadedMu.Lock()
+	runnerList := make([]*runnerRef, 0, len(s.loaded))
+	for _, r := range s.loaded {
+		if r.vramSize > 0 {
+			runnerList = append(runnerList, r)
+		}
+	}
+	s.loadedMu.Unlock()
+	if len(runnerList) == 0 {
+		slog.Debug("no loaded runner using VRAM to unload")
+		return nil
+	}
+	sort.Sort(ByDurationAndName(runnerList))
+	for _, runner := range runnerList {
+		runner.refMu.Lock()
+		rc := runner.refCount
+		runner.refMu.Unlock()
+		if rc == 0 {
+			slog.Debug("found an idle runner using VRAM to unload", "runner", runner)
+			return runner
+		}
+	}
+	slog.Debug("no idle runners using VRAM, picking the shortest duration", "runner_count", len(runnerList), "runner", runnerList[0])
 	return runnerList[0]
 }
 
