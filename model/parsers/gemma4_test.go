@@ -1501,3 +1501,208 @@ func TestParseGemma4ToolCall_RawQuotedStructuralString(t *testing.T) {
 		t.Fatalf("tool call mismatch (-want +got):\n%s", diff)
 	}
 }
+
+func TestRepairGemma4UnclosedBrackets(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "closes_list_and_object_at_end",
+			input:    `{edits:[{newText:<|"|>a<|"|>,oldText:<|"|>b<|"|>,path:<|"|>x<|"|>}`,
+			expected: `{edits:[{newText:<|"|>a<|"|>,oldText:<|"|>b<|"|>,path:<|"|>x<|"|>}]}`,
+		},
+		{
+			name:     "closes_list_before_a_key",
+			input:    `{edits:[{newText:<|"|>a<|"|>,oldText:<|"|>b<|"|>},path:<|"|>x<|"|>}`,
+			expected: `{edits:[{newText:<|"|>a<|"|>,oldText:<|"|>b<|"|>}],path:<|"|>x<|"|>}`,
+		},
+		{
+			name:     "closes_list_before_a_quoted_key",
+			input:    `{edits:[{a:1},"path":<|"|>x<|"|>}`,
+			expected: `{edits:[{a:1}],"path":<|"|>x<|"|>}`,
+		},
+		{
+			name:     "closes_list_where_its_object_closes",
+			input:    `{items:[1,2}`,
+			expected: `{items:[1,2]}`,
+		},
+		{
+			name:     "keeps_items_of_a_list",
+			input:    `{edits:[{a:1},{b:2}`,
+			expected: `{edits:[{a:1},{b:2}]}`,
+		},
+		{
+			name:     "keeps_strings_of_a_list",
+			input:    `{names:[<|"|>a<|"|>,<|"|>b<|"|>`,
+			expected: `{names:[<|"|>a<|"|>,<|"|>b<|"|>]}`,
+		},
+		{
+			name:     "ignores_brackets_in_strings",
+			input:    `{text:<|"|>[{,key:<|"|>,raw:"[x:{"`,
+			expected: `{text:<|"|>[{,key:<|"|>,raw:"[x:{"}`,
+		},
+		{
+			name:     "drops_a_brace_too_many_before_a_list_close",
+			input:    `{set:[{path:<|"|>a<|"|>,value:{b:1}}}]}`,
+			expected: `{set:[{path:<|"|>a<|"|>,value:{b:1}}]}`,
+		},
+		{
+			name:     "leaves_balanced_input",
+			input:    `{edits:[{a:1}],path:<|"|>x<|"|>}`,
+			expected: `{edits:[{a:1}],path:<|"|>x<|"|>}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := repairGemma4UnclosedBrackets(tt.input); got != tt.expected {
+				t.Fatalf("repairGemma4UnclosedBrackets(%q) = %q, want %q", tt.input, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestParseGemma4ClosedToolCall_ClosesUnclosedBrackets(t *testing.T) {
+	// The shapes of the 30 edit calls gemma4:e4b left unclosed in ollama/ollama#19273, its editRecord call with a
+	// brace too many, and #17565's missing brace. The last case also leaves a string unterminated, which has to be
+	// closed before the brackets can be.
+	tests := []struct {
+		name    string
+		content string
+		want    map[string]any
+	}{
+		{
+			name:    "path_inside_the_item_list_unclosed",
+			content: `call:edit{edits:[{newText:<|"|>a: 1<|"|>,oldText:<|"|>a: 0<|"|>,path:<|"|>x.yaml<|"|>}`,
+			want: map[string]any{"edits": []any{
+				map[string]any{"newText": "a: 1", "oldText": "a: 0", "path": "x.yaml"},
+			}},
+		},
+		{
+			name:    "list_unclosed_before_path",
+			content: `call:edit{edits:[{newText:<|"|>a: 1<|"|>,oldText:<|"|>a: 0<|"|>},path:<|"|>x.yaml<|"|>}`,
+			want: map[string]any{
+				"edits": []any{map[string]any{"newText": "a: 1", "oldText": "a: 0"}},
+				"path":  "x.yaml",
+			},
+		},
+		{
+			name:    "list_and_call_unclosed",
+			content: `call:edit{edits:[{newText:<|"|>a: 1<|"|>,oldText:<|"|>a: 0<|"|>}`,
+			want: map[string]any{"edits": []any{
+				map[string]any{"newText": "a: 1", "oldText": "a: 0"},
+			}},
+		},
+		{
+			name:    "two_items_list_unclosed_before_path",
+			content: `call:edit{edits:[{newText:<|"|>a<|"|>,oldText:<|"|>b<|"|>},{newText:<|"|>c<|"|>},path:<|"|>x.yaml<|"|>}`,
+			want: map[string]any{
+				"edits": []any{map[string]any{"newText": "a", "oldText": "b"}, map[string]any{"newText": "c"}},
+				"path":  "x.yaml",
+			},
+		},
+		{
+			name:    "brace_too_many_before_list_close",
+			content: `call:editRecord{record:<|"|>Hilda<|"|>,set:[{path:<|"|>Name<|"|>,value:<|"|>Hilda<|"|>},{path:<|"|>Level<|"|>,value:{LevelMult:1,CalcMinLevel:5}}}]}`,
+			want: map[string]any{
+				"record": "Hilda",
+				"set": []any{
+					map[string]any{"path": "Name", "value": "Hilda"},
+					map[string]any{"path": "Level", "value": map[string]any{"LevelMult": 1.0, "CalcMinLevel": 5.0}},
+				},
+			},
+		},
+		{
+			name:    "missing_final_brace",
+			content: `call:read_files{files:[{path:<|"|>assets.json<|"|>,start_line:1}]`,
+			want: map[string]any{"files": []any{
+				map[string]any{"path": "assets.json", "start_line": 1.0},
+			}},
+		},
+		{
+			name:    "string_and_list_unclosed",
+			content: `call:edit{edits:[{newText:<|"|>a: 1<|"|>,oldText:<|"|>a: 0}`,
+			want: map[string]any{"edits": []any{
+				map[string]any{"newText": "a: 1", "oldText": "a: 0"},
+			}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := parseGemma4ToolCall(tt.content, nil); err == nil {
+				t.Fatal("expected the call to fail without the repair")
+			}
+			got, err := parseGemma4ClosedToolCall(tt.content, nil)
+			if err != nil {
+				t.Fatalf("parseGemma4ClosedToolCall returned error: %v", err)
+			}
+			name := tt.content[len("call:"):strings.Index(tt.content, "{")]
+			want := api.ToolCall{Function: api.ToolCallFunction{Name: name, Arguments: testArgs(tt.want)}}
+			if diff := cmp.Diff(want, got, argsComparer); diff != "" {
+				t.Fatalf("tool call mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestGemma4Parser_UnclosedListInFinishedToolCall(t *testing.T) {
+	parser := &Gemma4Parser{hasThinkingSupport: true}
+	parser.Init(nil, nil, &api.ThinkValue{Value: true})
+
+	content, _, toolCalls, err := parser.Add(`<|tool_call>call:edit{edits:[{newText:<|"|>a<|"|>,oldText:<|"|>b<|"|>},path:<|"|>x.yaml<|"|>}<tool_call|>`, true)
+	if err != nil {
+		t.Fatalf("Add() error = %v", err)
+	}
+	if content != "" {
+		t.Fatalf("expected no content, got %q", content)
+	}
+	want := []api.ToolCall{{Function: api.ToolCallFunction{Name: "edit", Arguments: testArgs(map[string]any{
+		"edits": []any{map[string]any{"newText": "a", "oldText": "b"}},
+		"path":  "x.yaml",
+	})}}}
+	if diff := cmp.Diff(want, toolCalls, argsComparer); diff != "" {
+		t.Fatalf("tool calls mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestGemma4Parser_UnparsableToolCallIsContent(t *testing.T) {
+	tests := []struct {
+		name            string
+		input           string
+		expectedContent string
+	}{
+		{
+			// Finished, and still not valid once its brackets are closed: the client sees it.
+			name:            "finished_call",
+			input:           `<|tool_call>call:edit{edits:[{newText:<|"|>a<|"|>,oldText}<tool_call|>`,
+			expectedContent: `call:edit{edits:[{newText:<|"|>a<|"|>,oldText}`,
+		},
+		{
+			// Flushed on done, with no closing tag, it may have been cut off: not repaired, and passed on.
+			name:            "flushed_on_done",
+			input:           `<|tool_call>call:edit{edits:[{newText:<|"|>a<|"|>,oldText:<|"|>b<|"|>}`,
+			expectedContent: `call:edit{edits:[{newText:<|"|>a<|"|>,oldText:<|"|>b<|"|>}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parser := &Gemma4Parser{hasThinkingSupport: true}
+			parser.Init(nil, nil, &api.ThinkValue{Value: true})
+
+			content, _, toolCalls, err := parser.Add(tt.input, true)
+			if err != nil {
+				t.Fatalf("Add() error = %v", err)
+			}
+			if len(toolCalls) != 0 {
+				t.Fatalf("expected no tool calls, got %v", toolCalls)
+			}
+			if content != tt.expectedContent {
+				t.Fatalf("content = %q, want %q", content, tt.expectedContent)
+			}
+		})
+	}
+}

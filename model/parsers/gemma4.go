@@ -323,10 +323,13 @@ func (p *Gemma4Parser) eat(done bool) ([]gemma4Event, bool) {
 			p.buffer.WriteString(remaining)
 			p.state = Gemma4IgnoringPostToolCallNoise
 
-			if toolCall, err := parseGemma4ToolCall(toolCallContent, p.tools); err == nil {
+			if toolCall, err := parseGemma4ClosedToolCall(toolCallContent, p.tools); err == nil {
 				events = append(events, gemma4EventToolCall{toolCall: toolCall})
 			} else {
+				// Passed on as content rather than dropped: dropped, the response has neither a tool call
+				// nor content, and the client cannot tell the model its call was lost.
 				slog.Warn("gemma4 tool call parsing failed", "error", err, "content", toolCallContent)
+				events = append(events, gemma4EventContent{content: toolCallContent})
 			}
 			return events, true
 		}
@@ -340,6 +343,7 @@ func (p *Gemma4Parser) eat(done bool) ([]gemma4Event, bool) {
 				events = append(events, gemma4EventToolCall{toolCall: toolCall})
 			} else {
 				slog.Warn("gemma4 tool call flush on done failed", "error", err, "content", bufStr)
+				events = append(events, gemma4EventContent{content: bufStr})
 			}
 			return events, false
 		}
@@ -432,6 +436,138 @@ func parseGemma4ToolCall(content string, tools []api.Tool) (api.ToolCall, error)
 			Arguments: args,
 		},
 	}, nil
+}
+
+// parseGemma4ClosedToolCall parses a tool call the model finished, its closing
+// tag seen. Where that fails, it tries once more with the lists and objects the
+// model left open closed. The model wrote all of the call, so closing them adds
+// no argument it did not write. A call flushed on done, with no closing tag, may
+// have been cut off and is not repaired this way.
+//
+// gemma4:e4b leaves a list of objects with long string values unclosed, as in
+// call:edit{edits:[{newText:<|"|>…<|"|>,oldText:<|"|>…<|"|>,path:<|"|>…<|"|>}
+// (ollama/ollama#19273), and once closed an object in a list with a brace too
+// many: set:[…,{path:<|"|>Level<|"|>,value:{…}}}]}.
+func parseGemma4ClosedToolCall(content string, tools []api.Tool) (api.ToolCall, error) {
+	toolCall, err := parseGemma4ToolCall(content, tools)
+	if err == nil {
+		return toolCall, nil
+	}
+
+	braceIdx := strings.Index(content, "{")
+	if !strings.HasPrefix(content, "call:") || braceIdx == -1 {
+		return toolCall, err
+	}
+
+	// The string delimiter is repaired first. The bracket repair skips strings,
+	// so one left unterminated would hide every bracket after it.
+	closed := content[:braceIdx] + repairGemma4UnclosedBrackets(repairGemma4MissingStringDelimiter(content[braceIdx:]))
+	if closed == content {
+		return toolCall, err
+	}
+
+	if repaired, repairErr := parseGemma4ToolCall(closed, tools); repairErr == nil {
+		return repaired, nil
+	}
+
+	return toolCall, err
+}
+
+// repairGemma4UnclosedBrackets closes the lists and objects left open in Gemma 4
+// arguments. A list still open where `}` closes the object around it, or where
+// `,` is followed by a key, gets its `]` there. A `}` there that the list's own
+// `]` follows closes nothing and is dropped. Whatever is still open at the
+// end is closed, innermost first. Strings are copied as they are.
+func repairGemma4UnclosedBrackets(s string) string {
+	var sb strings.Builder
+	sb.Grow(len(s) + 4)
+	var open []byte
+	top := func() byte {
+		if len(open) == 0 {
+			return 0
+		}
+		return open[len(open)-1]
+	}
+
+	for i := 0; i < len(s); {
+		if strings.HasPrefix(s[i:], gemma4StringDelimiter) {
+			start := i + len(gemma4StringDelimiter)
+			end := strings.Index(s[start:], gemma4StringDelimiter)
+			if end == -1 {
+				sb.WriteString(s[i:])
+				break
+			}
+			stop := start + end + len(gemma4StringDelimiter)
+			sb.WriteString(s[i:stop])
+			i = stop
+			continue
+		}
+
+		if s[i] == '"' {
+			if end := gemma4JSONQuotedStringEnd(s, i); end != -1 {
+				sb.WriteString(s[i:end])
+				i = end
+				continue
+			}
+		}
+
+		switch s[i] {
+		case '{', '[':
+			open = append(open, s[i])
+		case '}':
+			if top() == '[' {
+				// With the list's own `]` next, this brace closes nothing: one too many.
+				if next := gemma4SkipSpace(s, i+1); next < len(s) && s[next] == ']' {
+					i++
+					continue
+				}
+				sb.WriteByte(']')
+				open = open[:len(open)-1]
+			}
+			if top() == '{' {
+				open = open[:len(open)-1]
+			}
+		case ']':
+			if top() == '[' {
+				open = open[:len(open)-1]
+			}
+		case ',':
+			if top() == '[' && gemma4KeyFollows(s, i+1) {
+				sb.WriteByte(']')
+				open = open[:len(open)-1]
+			}
+		}
+
+		sb.WriteByte(s[i])
+		i++
+	}
+
+	for j := len(open) - 1; j >= 0; j-- {
+		if open[j] == '{' {
+			sb.WriteByte('}')
+		} else {
+			sb.WriteByte(']')
+		}
+	}
+
+	return sb.String()
+}
+
+// gemma4KeyFollows reports whether an object's key, bare or JSON-quoted, and its
+// colon start at s[i], after any whitespace.
+func gemma4KeyFollows(s string, i int) bool {
+	i = gemma4SkipSpace(s, i)
+	if i < len(s) && s[i] == '"' {
+		end := gemma4JSONQuotedStringEnd(s, i)
+		if end == -1 {
+			return false
+		}
+		end = gemma4SkipSpace(s, end)
+		return end < len(s) && s[end] == ':'
+	}
+
+	keyEnd := gemma4BareKeyEnd(s, i)
+	return keyEnd > i && keyEnd < len(s) && s[keyEnd] == ':'
 }
 
 // gemma4ArgsToJSON converts Gemma 4's custom argument format to valid JSON.
